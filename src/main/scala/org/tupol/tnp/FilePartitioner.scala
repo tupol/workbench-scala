@@ -4,6 +4,7 @@ import java.io.{FileInputStream, FileOutputStream, RandomAccessFile}
 import java.nio.channels.FileChannel
 import java.nio.file.{Files, Path, StandardOpenOption}
 
+import org.tupol.tnp.FilePartitioner.findFirst
 import org.tupol.utils.Bracket
 import org.tupol.utils.implicits._
 
@@ -11,6 +12,10 @@ import scala.annotation.tailrec
 import scala.util.Try
 
 object FilePartitioner {
+
+  val KB = 1024
+  val MB = 1024 * KB
+  val GB = 1024 * MB
 
   def partitionFile(from: Path, toDir: Path, partitionMarkers: Seq[Long]): Try[Traversable[(Path, Long)]] =
     Bracket.auto(FileChannel.open(from, StandardOpenOption.READ)) { f =>
@@ -42,46 +47,85 @@ object FilePartitioner {
     }.flatten
   }
 
-  def findParSplits(path: Path, pattern: String): Try[Seq[Long]] = {
+  def findParSplitsFwd(path: Path, pattern: String): Try[Seq[Long]] = {
     Bracket.auto(new RandomAccessFile(path.toFile, "r")) { raf =>
       val minSplitSizeBytes = defaultSplitSize(raf.length())
-      findParSplits(raf, minSplitSizeBytes, pattern)
+      println(s"minSplitSizeBytes = $minSplitSizeBytes")
+      findParSplitsFwd(path, minSplitSizeBytes, pattern)
+    }.flatten
+  }
+  def findParSplitsRev(path: Path, pattern: String): Try[Seq[Long]] = {
+    Bracket.auto(new RandomAccessFile(path.toFile, "r")) { raf =>
+      val maxSplitSizeBytes = defaultSplitSize(raf.length())
+      println(s"maxSplitSizeBytes = $maxSplitSizeBytes")
+      findParSplitsRev(raf, maxSplitSizeBytes, pattern)
     }
   }
   /** Find the indices for split in the given file, such as the split will be done after at least
    * `minSplitSize` and including the given split pattern */
-  def findParSplits(raf: RandomAccessFile, minSplitSizeBytes: Long, pattern: String): Seq[Long] = {
+  def findParSplitsFwd(path: Path, minSplitSizeBytes: Long, pattern: String): Try[Seq[Long]] =
+    Bracket.auto(new RandomAccessFile(path.toFile, "r")) { raf =>
     val size = raf.length()
-    val x = new Array[Byte](300)
+    val seekBuff = new Array[Byte](1 * KB)
 
     def findParSplits(position: Long, acc: Seq[Long]): Seq[Long] = {
       raf.seek(position)
       if (position >= size || position + minSplitSizeBytes >= size) size +: acc
       else {
-        raf.read(x)
-        val res = findFirst(pattern.getBytes, x.iterator)
-        if (res == -1) findParSplits(position + x.size, acc)
-        else {
-          findParSplits(position + res + pattern.size + minSplitSizeBytes, (position + res + pattern.size) +: acc)
+        raf.read(seekBuff)
+        findFirst(pattern.getBytes, seekBuff.iterator) match {
+          case None => findParSplits(position + seekBuff.size, acc)
+          case Some(res) =>
+            val marker = position + res + pattern.size
+            findParSplits(marker + minSplitSizeBytes, marker +: acc)
         }
       }
     }
-
     findParSplits(minSplitSizeBytes, Seq(0))
+  }
+
+  /** Find the indices for split in the given file, such as the split will be done after at most
+   * `maxSplitSize` and including the given split pattern */
+  def findParSplitsRev(raf: RandomAccessFile, maxSplitSizeBytes: Long, pattern: String): Seq[Long] = {
+    val size = raf.length()
+    val seekBuff = new Array[Byte](1 * KB)
+
+    def findParSplits(position: Long, acc: Seq[Long]): Seq[Long] = {
+      val start = position - seekBuff.size
+      println(s"start from $start")
+      raf.seek(start)
+      if (start >= size || position + maxSplitSizeBytes >= size) {
+        println(s"start >= size = ${start >= size}")
+        println(s"position + maxSplitSizeBytes >= size = ${position + maxSplitSizeBytes >= size}")
+        size +: acc
+      }
+      else {
+        raf.read(seekBuff)
+        findFirst(pattern.getBytes, seekBuff.iterator) match {
+          case None => findParSplits(start, acc)
+          case Some(res) =>
+            val marker = start + res + pattern.size
+            println(s"  marker = $marker")
+            findParSplits(marker + maxSplitSizeBytes, marker +: acc)
+        }
+      }
+    }
+    findParSplits(maxSplitSizeBytes, Seq(0))
   }
 
   /** Returns the position of the first character of the pattern in the input
    * or -1 if pattern was not found */
-  def findFirst[T](pattern: Seq[T], in: Iterator[T]): Int = {
+  def findFirst[T](pattern: Seq[T], in: Iterator[T]): Option[Long] = {
     @tailrec
-    def ffp(src: in.GroupedIterator[T], pos: Int, found: Boolean = false): Int =
-      if (found) pos - 1
-      else if (!src.hasNext) -1
+    def ffp(src: in.GroupedIterator[T], pos: Long, found: Boolean = false): Option[Long] =
+      if (found) Some(pos - 1)
+      else if (!src.hasNext) None
       else ffp(src, pos + 1, src.next() == pattern)
-
-    ffp(in.sliding(pattern.size), 0)
+    if(pattern.isEmpty || in.isEmpty) None
+    else ffp(in.sliding(pattern.size), 0)
   }
-  def defaultSplitSize(fileSize: Long) = math.max((fileSize / 10.0).toLong,  100000)
+
+  def defaultSplitSize(fileSize: Long) = math.max((fileSize / 10.0).toLong,  10 * MB)
 
   def defaultMergeFile(targetDir: Path) = targetDir.resolve(targetDir.getFileName.toString)
 
