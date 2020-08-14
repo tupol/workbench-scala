@@ -1,11 +1,11 @@
 package org.tupol.tnp
 
-import java.io.{ FileInputStream, FileOutputStream, RandomAccessFile }
+import java.io.{ FileInputStream, FileOutputStream }
 import java.nio.ByteBuffer
 import java.nio.channels.FileChannel
 import java.nio.file.{ Files, Path, StandardOpenOption }
+import java.util.UUID
 
-import org.tupol.tnp.FilePartitioner.findFirst
 import org.tupol.utils.Bracket
 import org.tupol.utils.implicits._
 
@@ -18,32 +18,97 @@ object FilePartitioner {
   val MB = 1024 * KB
   val GB = 1024 * MB
 
+  /**
+   * @param config
+   * @param upperPartitionLimit when true, the partition size will never exceed config.splitSizeLimit
+   */
+  class Partitioner(val config: FilePartitioner.PartitioningParams, upperPartitionLimit: Boolean = true) {
+
+    def partition(from: Path, toDir: Path): Try[Traversable[(Path, Long)]] =
+      Bracket
+        .auto(FileChannel.open(from, StandardOpenOption.READ)) { file =>
+          for {
+            partitionMarkers <- if (upperPartitionLimit)
+                                 findRevPartitionsInFile(file, config)
+                               else
+                                 findFwdPartitionsInFile(file, config)
+            partitionFiles <- partitionFile(file, toDir, partitionMarkers)
+          } yield partitionFiles
+        }
+        .flatten
+  }
+
+  def maxPartitionSizePartitioner(delimiter: Seq[Byte], partitionSize: Long) =
+    new Partitioner(PartitioningParams(delimiter, splitSizeLimit = partitionSize), upperPartitionLimit = true)
+
+  def minPartitionSizePartitioner(delimiter: Seq[Byte], partitionSize: Long) =
+    new Partitioner(PartitioningParams(delimiter, splitSizeLimit = partitionSize), upperPartitionLimit = false)
+
+  /**
+   * File Partitioning parameters
+   * @param delimiter The sequence of bytes that separate the partitions
+   * @param splitSizeLimit The partition size limit in bytes. Depending on the strategy it can be a lower or an upper limit.
+   * @param seekBufferSize The maximum search buffer size
+   * @param maxSearchSize The maximum search size
+   */
+  case class PartitioningParams(
+    delimiter: Seq[Byte],
+    splitSizeLimit: Long,
+    seekBufferSize: Int = 1 * KB,
+    maxSearchSize: Option[Long] = None
+  ) {
+    require(!delimiter.isEmpty, "The delimiter can not be empty")
+    require(seekBufferSize > 0, s"The seekBufferSize is $seekBufferSize but it must be a positive number larger than 0")
+    require(
+      splitSizeLimit >= seekBufferSize,
+      s"The splitSizeLimit is $splitSizeLimit and it must be equal or greater than seekBufferSize that is $seekBufferSize"
+    )
+    maxSearchSize.map(
+      mss =>
+        require(
+          mss >= seekBufferSize,
+          s"The maxSearchSize is $mss and it must be equal or greater than seekBufferSize that is $seekBufferSize"
+        )
+    )
+  }
+
   def partitionFile(from: Path, toDir: Path, partitionMarkers: Seq[Long]): Try[Traversable[(Path, Long)]] =
     Bracket
-      .auto(FileChannel.open(from, StandardOpenOption.READ)) { f =>
-        for {
-          _ <- Try(Files.createDirectory(toDir))
-          results <- partitionMarkers
-                      .sliding(2)
-                      .zipWithIndex
-                      .map {
-                        case (sidx +: eidx +: Nil, idx) =>
-                          val size       = eidx - sidx
-                          val targetPath = partitionPath(from, toDir, idx)
-                          Bracket.auto(FileChannel.open(targetPath, StandardOpenOption.WRITE)) { t =>
-                            val txr = t.transferFrom(f, 0, size)
-                            // println(s"Transfer from $sidx to $eidx ($size) to $targetPath ($txr)")
-                            (targetPath, txr)
-                          }
-                      }
-                      .toSeq
-                      .allOkOrFail
-        } yield results
+      .auto(FileChannel.open(from, StandardOpenOption.READ)) { file =>
+        partitionFile(file, toDir, partitionMarkers, from.getFileName.toString)
       }
       .flatten
 
-  def partitionPath(from: Path, toDir: Path, part: Int): Path =
-    Files.createFile(toDir.resolve(f"${from.getFileName.toString}.p$part%04d"))
+  def partitionFile(
+    file: FileChannel,
+    toDir: Path,
+    partitionMarkers: Seq[Long],
+    name: String = UUID.randomUUID().toString
+  ): Try[Traversable[(Path, Long)]] =
+    for {
+      _ <- Try(Files.createDirectory(toDir))
+      results <- partitionMarkers
+                  .sliding(2)
+                  .zipWithIndex
+                  .map {
+                    case (start +: end +: Nil, part) =>
+                      val size       = end - start
+                      val targetPath = createPartitionPath(name, toDir, part)
+                      Bracket.auto(FileChannel.open(targetPath, StandardOpenOption.WRITE)) { t =>
+                        val txr = t.transferFrom(file, 0, size)
+                        // println(s"Transfer from $start to $end ($size) to $targetPath ($txr)")
+                        (targetPath, txr)
+                      }
+                  }
+                  .toSeq
+                  .allOkOrFail
+    } yield results
+
+  def createPartitionPath(from: Path, toDir: Path, part: Int): Path =
+    createPartitionPath(from.getFileName.toString, toDir, part)
+
+  def createPartitionPath(name: String, toDir: Path, part: Int): Path =
+    Files.createFile(toDir.resolve(f"$name.p$part%04d"))
 
   def mergeFiles(from: Seq[Path], to: Path): Try[Traversable[Long]] =
     Bracket
@@ -60,142 +125,110 @@ object FilePartitioner {
   def findParSplitsFwd(path: Path, delimiter: Seq[Byte]): Try[Seq[Long]] =
     Bracket
       .auto(FileChannel.open(path, StandardOpenOption.READ)) { file =>
-        val minSplitSizeBytes = defaultSplitSize(file.size())
-        println(s"minSplitSizeBytes = $minSplitSizeBytes")
-        findFwdPartitionsInPath(path, minSplitSizeBytes, delimiter)
+        val splitSizeLimit = defaultSplitSize(file.size())
+//        println(s"splitSizeLimit = $splitSizeLimit")
+        findFwdPartitionsInPath(path, PartitioningParams(delimiter, splitSizeLimit))
       }
       .flatten
   def findParSplitsRev(path: Path, delimiter: Seq[Byte]): Try[Seq[Long]] =
     Bracket
       .auto(FileChannel.open(path, StandardOpenOption.READ)) { file =>
-        val maxSplitSizeBytes = defaultSplitSize(file.size())
-        println(s"maxSplitSizeBytes = $maxSplitSizeBytes")
-        findRevPartitionsInPath(path, maxSplitSizeBytes, delimiter)
+        val splitSizeLimit = defaultSplitSize(file.size())
+//        println(s"splitSizeLimit = $splitSizeLimit")
+        findRevPartitionsInPath(path, PartitioningParams(delimiter, splitSizeLimit))
       }
       .flatten
 
-  /** Find the indices for split in the given file, such as the split will be done after at least
-   * `minSplitSize` and including the given split delimiter */
-  def findFwdPartitionsInPath(
-    path: Path,
-    minSplitSizeBytes: Long,
-    delimiter: Seq[Byte],
-    seekBufferSize: Int = 1 * KB,
-    maxSearchSize: Option[Long] = None
-  ): Try[Seq[Long]] =
+  /**
+   * Find the indices for split in the given file, such as the split will be done after at least
+   * `splitSizeLimit` and including the given split delimiter
+   */
+  def findFwdPartitionsInPath(path: Path, params: PartitioningParams): Try[Seq[Long]] =
     Bracket
       .auto(FileChannel.open(path, StandardOpenOption.READ)) { file =>
-        findFwdPartitionsInFile(file, minSplitSizeBytes, delimiter, seekBufferSize, maxSearchSize)
+        findFwdPartitionsInFile(file, params)
       }
       .flatten
 
-  def findFwdPartitionsInFile(
-    file: FileChannel,
-    minSplitSizeBytes: Long,
-    delimiter: Seq[Byte],
-    seekBufferSize: Int = 1 * KB,
-    maxSearchSize: Option[Long] = None
-  ): Try[Seq[Long]] = Try {
-    require(
-      seekBufferSize < minSplitSizeBytes,
-      s"seekBufferSize is $seekBufferSize must be smaller than maxSplitSizeBytes that is $minSplitSizeBytes"
-    )
-    val size           = file.size()
-    val seekBuff       = ByteBuffer.allocate(seekBufferSize)
+  def findFwdPartitionsInFile(file: FileChannel, params: PartitioningParams): Try[Seq[Long]] = Try {
+    import params._
+    val size = file.size()
+    require(size > 0, s"Can not partition an empty file")
+    val seekBuff = ByteBuffer.allocate(seekBufferSize)
 
-    def findParSplits(position: Long, acc: Seq[Long]): Seq[Long] = {
+    def findParSplits(cursor: Long, acc: Seq[Long]): Seq[Long] = {
       if (maxSearchSize.isDefined && math.abs(acc.last - maxSearchSize.get) >= 0)
-        throw new Exception(
-          s"Unable to find the delimiter in ($minSplitSizeBytes) bytes starting from ${acc.last}"
-        )
+        throw new Exception(s"Unable to find the delimiter in ($splitSizeLimit) bytes starting from ${acc.last}")
       if (acc.last == size) acc
-      else if (position >= size) acc :+ size
+      else if (cursor >= size) acc :+ size
       else {
-        file.position(position)
+        file.position(cursor)
         file.read(seekBuff)
         findFirst(delimiter, seekBuff.array.iterator) match {
-          case None => findParSplits(position + seekBufferSize, acc)
+          case None => findParSplits(cursor + seekBufferSize, acc)
           case Some(res) =>
-            val marker = position + res + delimiter.size
-            findParSplits(marker + minSplitSizeBytes, acc :+ marker)
+            val marker = cursor + res + delimiter.size
+            findParSplits(marker + splitSizeLimit, acc :+ marker)
         }
       }
     }
-    findParSplits(minSplitSizeBytes, IndexedSeq(0))
+    findParSplits(splitSizeLimit, IndexedSeq(0))
   }
 
-  /** Find the indices for split in the given file, such as the split will be done after at most
-   * `maxSplitSize` and including the given split delimiter */
-  def findRevPartitionsInPath(
-    path: Path,
-    maxSplitSizeBytes: Long,
-    delimiter: Seq[Byte],
-    seekBufferSize: Int = 1 * KB,
-    maxSearchSize: Option[Long] = None
-  ): Try[Seq[Long]] = {
-    require(
-      maxSplitSizeBytes > 0,
-      s"maxSplitSizeBytes is $maxSplitSizeBytes but it must be a positive number larger than 0"
-    )
-    require(
-      seekBufferSize <= maxSplitSizeBytes,
-      s"seekBufferSize is $seekBufferSize must be smaller or equal to maxSplitSizeBytes that is $maxSplitSizeBytes"
-    )
+  /**
+   * Find the indices for split in the given file, such as the split will be done after at most
+   * `splitSizeLimit` and including the given split delimiter
+   */
+  def findRevPartitionsInPath(path: Path, params: PartitioningParams): Try[Seq[Long]] =
     Bracket
       .auto(FileChannel.open(path, StandardOpenOption.READ)) { file =>
-        findRevPartitionsInFile(file, maxSplitSizeBytes, delimiter, seekBufferSize, maxSearchSize)
-      }.flatten
-  }
+        findRevPartitionsInFile(file, params)
+      }
+      .flatten
 
-  /** Find the indices for split in the given file, such as the split will be done after at most
-   * `maxSplitSize` and including the given split delimiter */
-  def findRevPartitionsInFile(
-    file: FileChannel,
-    maxSplitSizeBytes: Long,
-    delimiter: Seq[Byte],
-    seekBufferSize: Int = 1 * KB,
-    maxSearchSize: Option[Long] = None
-  ): Try[Seq[Long]] = Try {
-    require(
-      maxSplitSizeBytes > 0,
-      s"maxSplitSizeBytes is $maxSplitSizeBytes but it must be a positive number larger than 0"
-    )
-    require(
-      seekBufferSize <= maxSplitSizeBytes,
-      s"seekBufferSize is $seekBufferSize must be smaller or equal to maxSplitSizeBytes that is $maxSplitSizeBytes"
-    )
-
-    val size           = file.size()
-    val seekBuff       = ByteBuffer.allocate(seekBufferSize)
+  /**
+   * Find the indices for split in the given file, such as the split will be done after at most
+   * `splitSizeLimit` and including the given split delimiter
+   */
+  def findRevPartitionsInFile(file: FileChannel, params: PartitioningParams): Try[Seq[Long]] = Try {
+    import params._
+    val size = file.size()
+    require(size > 0, s"Can not partition an empty file")
+    val seekBuff     = ByteBuffer.allocate(seekBufferSize)
     val delimiterRev = delimiter.reverse
-    def findParSplits(position: Long, acc: Seq[Long]): Seq[Long] = {
-      val start = position - seekBufferSize
-      if (start < 0)
-        throw new Exception(
-          s"Unable to find the delimiter in ($maxSplitSizeBytes) bytes going backward, starting from $position"
-        )
-      if (maxSearchSize.isDefined && math.abs(acc.last - maxSearchSize.get) >= 0)
-        throw new Exception(
-          s"Unable to find the delimiter in ($maxSplitSizeBytes) bytes going backward, starting from ${acc.last}"
-        )
+    def findParSplits(cursor: Long, acc: Seq[Long], attempt: Int = 1): Seq[Long] = {
+      val seek = cursor - attempt * seekBufferSize
 
-      if (position >= size) acc :+ size
+//      println(s"cursor=$cursor; seek=$seek; attempt=$attempt; acc=$acc; maxSearchSize=$maxSearchSize")
+
+      if (maxSearchSize.isDefined && math.abs(acc.last + maxSearchSize.get) < cursor)
+        throw new Exception(
+          s"Unable to find the delimiter in ($splitSizeLimit) bytes going backward, starting from ${acc.last}"
+        )
+      if (seek < acc.last)
+        // We didn't find the delimiter reaching the previous marker, so move the cursor ahead
+        findParSplits(cursor + splitSizeLimit, acc)
+      else if (cursor >= size)
+        // The cursor has reached the end so we have a result
+        acc :+ size
       else {
-        file.position(start)
+        file.position(seek)
         file.read(seekBuff)
         findFirst(delimiterRev, seekBuff.array.reverseIterator) match {
-          case None => findParSplits(start, acc)
+          case None => findParSplits(cursor, acc, attempt + 1)
           case Some(res) =>
-            val marker = start + seekBufferSize - res
-            findParSplits(marker + maxSplitSizeBytes, acc :+ marker)
+            val marker = seek + seekBufferSize - res
+            findParSplits(marker + splitSizeLimit, acc :+ marker)
         }
       }
     }
-    findParSplits(maxSplitSizeBytes, IndexedSeq(0))
+    findParSplits(splitSizeLimit, IndexedSeq(0))
   }
 
-  /** Returns the position of the first character of the delimiter in the input
-   * or -1 if delimiter was not found */
+  /**
+   * Returns the position of the first character of the delimiter in the input
+   * or -1 if delimiter was not found
+   */
   def findFirst[T](pattern: Seq[T], in: Iterator[T]): Option[Long] = {
     @tailrec
     def ffp(src: in.GroupedIterator[T], pos: Long, found: Boolean = false): Option[Long] =
