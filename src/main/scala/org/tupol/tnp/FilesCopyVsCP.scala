@@ -24,8 +24,8 @@ object FilesCopyVsCP extends App {
       // println(s"Copied $from to $to in ${FiniteDuration(t, MILLISECONDS)}")
       Files.delete(to)
       t
-    }.sum
-    Throughput(Files.size(from), FiniteDuration((totalRuntimeMillis.toDouble / samples).toLong, MILLISECONDS))
+    }.reduce(_ + _)
+    Throughput(Files.size(from), totalRuntimeMillis / samples)
   }
 
   case class Throughput(bytes: Long, duration: FiniteDuration) {

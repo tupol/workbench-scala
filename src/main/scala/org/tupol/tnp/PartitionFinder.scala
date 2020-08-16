@@ -54,9 +54,7 @@ class MaxPartSizeFinder(params: PartitioningParams) extends PartitionFinder {
 
     def findParSplits(cursor: Long, acc: Seq[Long], attempt: Int = 1): Seq[Long] = {
       val seek = cursor - attempt * seekBufferSize
-
-       // println(s"cursor=$cursor; seek=$seek; attempt=$attempt; acc=$acc; maxSearchSize=$maxSearchSize")
-
+      // println(s"cursor=$cursor; seek=$seek; attempt=$attempt; acc=$acc; maxSearchSize=$maxSearchSize")
       if (maxSearchSize.isDefined && math.abs(attempt * seekBufferSize) > maxSearchSize.get)
         throw new Exception(
           s"Unable to find the delimiter in (${maxSearchSize.get}) bytes going backward, starting from $cursor")
@@ -68,6 +66,7 @@ class MaxPartSizeFinder(params: PartitioningParams) extends PartitionFinder {
         acc :+ size
       else {
         file.position(seek)
+        seekBuff.clear()
         file.read(seekBuff)
         findFirst(delimiterRev, seekBuff.array.reverseIterator) match {
           case None => findParSplits(cursor, acc, attempt + 1)
@@ -77,7 +76,6 @@ class MaxPartSizeFinder(params: PartitioningParams) extends PartitionFinder {
         }
       }
     }
-
     findParSplits(splitSizeLimit, IndexedSeq(0))
   }
 }
@@ -93,22 +91,24 @@ class MinPartSizeFinder(params: PartitioningParams) extends PartitionFinder {
     require(size > 0, s"Can not partition an empty file")
     val seekBuff = ByteBuffer.allocate(seekBufferSize)
 
-    def findParSplits(cursor: Long, acc: Seq[Long]): Seq[Long] = {
-
-      // println(s"cursor=$cursor; acc=$acc; maxSearchSize=$maxSearchSize")
-
-      if (maxSearchSize.isDefined && math.abs(cursor - splitSizeLimit - acc.last) >= maxSearchSize.get)
+    def findParSplits(cursor: Long, acc: Seq[Long], attempt: Int = 0): Seq[Long] = {
+      val seek = cursor + attempt * seekBufferSize
+      // println(s"cursor=$cursor; seek=$seek; attempt=$attempt; acc=$acc; maxSearchSize=$maxSearchSize")
+      if (maxSearchSize.isDefined && (seek - cursor) > maxSearchSize.get)
         throw new Exception(s"Unable to find the delimiter in (${maxSearchSize.get}) bytes starting from $cursor")
       if (acc.last == size) acc
-      else if (cursor >= size) acc :+ size
+      else if (seek >= size) acc :+ size
       else {
-        file.position(cursor)
+        file.position(seek)
+        seekBuff.clear()
         file.read(seekBuff)
         findFirst(delimiter, seekBuff.array.iterator) match {
-          case None => findParSplits(cursor + seekBufferSize, acc)
+          case None => findParSplits(cursor, acc, attempt + 1)
           case Some(res) =>
-            val marker = cursor + res + delimiter.size
-            findParSplits(marker + splitSizeLimit, acc :+ marker)
+            val marker = seek + res + delimiter.size
+            if (maxSearchSize.isDefined && (marker - cursor) > maxSearchSize.get)
+              throw new Exception(s"Unable to find the delimiter in (${maxSearchSize.get}) bytes starting from $cursor")
+            findParSplits(marker + splitSizeLimit, acc :+ marker, 0)
         }
       }
     }

@@ -33,12 +33,12 @@ package object tnp {
   }
 
   def generateTextFile(path: Path, size: Long): Path = {
-    require(size % 2 == 0, "The given size must be an even number")
-    val CRNL = "\r\n".getBytes
     val bbsize = 100 * KB
     val buffer = ByteBuffer.allocate(bbsize)
-    (0 until (bbsize) / 2 - 1).map(_ => buffer.putChar(Random.nextPrintableChar()))
-    buffer.put(CRNL)
+
+    val randomString = new String((0 until (bbsize - 1)).map(_ => Random.nextPrintableChar()).toArray)
+    buffer.put((randomString + "\n").getBytes)
+
     val reminder = (size % bbsize).toInt
     val parts = (size / bbsize).toInt
     val lastBuf = ByteBuffer.wrap(buffer.array().take(reminder))
